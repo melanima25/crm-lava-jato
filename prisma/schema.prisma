@@ -1,0 +1,246 @@
+// Schema Prisma — E0: User; E2: Customer e Vehicle; E3: catálogo; E4: atendimentos e caixa; E5: LoginAttempt; E8: StockMovement. Cada entrega adiciona suas tabelas.
+// Ver docs/modelo-dados.md.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+enum VehicleType {
+  CAR
+  MOTORCYCLE
+}
+
+model Customer {
+  id         Int            @id @default(autoincrement())
+  name       String
+  // Nome sem acento e em minúsculas, mantido por src/server/customers/domain.ts (D-32).
+  searchName String
+  // Somente dígitos.
+  phone      String?
+  notes      String?
+  active     Boolean        @default(true)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  vehicles   Vehicle[]
+  orders     ServiceOrder[]
+
+  @@index([name])
+  @@index([searchName])
+  @@index([phone])
+}
+
+model Vehicle {
+  id         Int            @id @default(autoincrement())
+  customerId Int
+  customer   Customer       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  type       VehicleType
+  // Normalizada (ABC1D23); única quando preenchida.
+  plate      String?        @unique
+  brand      String?
+  model      String?
+  color      String?
+  notes      String?
+  active     Boolean        @default(true)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  orders     ServiceOrder[]
+
+  @@index([customerId])
+}
+
+// Entrega 3: catálogo. Futuras FKs para estas tabelas (ServiceOrderItem.serviceId/productId,
+// StockMovement.productId) devem usar `onDelete: Restrict` explícito (D-35): em relação opcional o
+// padrão do Prisma seria SetNull, o que apagaria silenciosamente o vínculo do histórico.
+model Service {
+  id                   Int                @id @default(autoincrement())
+  name                 String
+  // Nome sem acento/minúsculas; ÚNICO (nome duplicado sem diferenciar caixa/acento) — D-34.
+  searchName           String             @unique
+  description          String?
+  carPriceCents        Int?
+  motorcyclePriceCents Int?
+  active               Boolean            @default(true)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  orderItems           ServiceOrderItem[]
+
+  @@index([active])
+}
+
+model Product {
+  id               Int                @id @default(autoincrement())
+  name             String
+  // Nome sem acento/minúsculas; ÚNICO — D-34.
+  searchName       String             @unique
+  description      String?
+  unit             String             @default("un")
+  salePriceCents   Int?
+  // Cache do estoque (D-13): = Σ StockMovement.quantity, escrito SÓ por recomputeProductStock (D-55).
+  stockQuantity    Int                @default(0)
+  // Alerta de "estoque baixo": estoque <= mínimo (null = sem alerta) — D-56.
+  minStockQuantity Int?
+  active           Boolean            @default(true)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  orderItems       ServiceOrderItem[]
+  movements        StockMovement[]
+
+  @@index([active])
+}
+
+// Entrega 4: atendimentos e pagamentos. StockMovement (baixa SALE de produto) fica para a E8.
+enum ServiceOrderStatus {
+  OPEN
+  DONE
+  CANCELED
+}
+
+enum OrderItemKind {
+  SERVICE
+  PRODUCT
+}
+
+enum CashDirection {
+  IN
+  OUT
+}
+
+// Sem "Fiado": fiado é ausência de pagamento (D-28).
+enum PaymentMethod {
+  CASH
+  PIX
+  DEBIT_CARD
+  CREDIT_CARD
+}
+
+model ServiceOrder {
+  id            Int                @id @default(autoincrement())
+  customerId    Int
+  customer      Customer           @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  vehicleId     Int?
+  vehicle       Vehicle?           @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  status        ServiceOrderStatus @default(OPEN)
+  occurredAt    DateTime           @default(now())
+  completedAt   DateTime?
+  discountCents Int                @default(0)
+  // Caches (D-13): escritos SOMENTE por recalcOrder (src/server/orders/domain.ts).
+  totalCents    Int                @default(0)
+  paidCents     Int                @default(0)
+  notes         String?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  items         ServiceOrderItem[]
+  payments      CashEntry[]
+
+  @@index([customerId])
+  @@index([status, occurredAt])
+  @@index([occurredAt])
+}
+
+model ServiceOrderItem {
+  id             Int            @id @default(autoincrement())
+  orderId        Int
+  order          ServiceOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  kind           OrderItemKind
+  serviceId      Int?
+  service        Service?       @relation(fields: [serviceId], references: [id], onDelete: Restrict) // D-35
+  productId      Int?
+  product        Product?       @relation(fields: [productId], references: [id], onDelete: Restrict) // D-35
+  description    String
+  quantity       Int            @default(1)
+  unitPriceCents Int
+  totalCents     Int
+  // Baixa SALE do item (só itens PRODUCT de OS DONE; E9) — D-57.
+  stockMovement  StockMovement?
+
+  @@index([orderId])
+  @@index([serviceId])
+  @@index([productId])
+}
+
+model CashCategory {
+  id        Int           @id @default(autoincrement())
+  name      String
+  direction CashDirection
+  active    Boolean       @default(true)
+  entries   CashEntry[]
+
+  @@unique([name, direction])
+}
+
+// Pagamento de OS = CashEntry IN com serviceOrderId (D-12). Lançamentos manuais (categoryId) vêm na E7.
+model CashEntry {
+  id             Int             @id @default(autoincrement())
+  direction      CashDirection
+  amountCents    Int
+  method         PaymentMethod
+  categoryId     Int?
+  category       CashCategory?   @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  serviceOrderId Int?
+  serviceOrder   ServiceOrder?   @relation(fields: [serviceOrderId], references: [id], onDelete: Restrict)
+  description    String?
+  occurredAt     DateTime
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  // Movimentação de estoque (entrada) que gerou esta despesa, se houver (E8).
+  stockMovements StockMovement[]
+
+  @@index([occurredAt])
+  @@index([serviceOrderId])
+  @@index([categoryId])
+}
+
+// Entrega 8: movimentações de estoque (D-55..D-57). `quantity` é o delta com sinal.
+enum StockMovementType {
+  IN
+  OUT
+  ADJUSTMENT
+  SALE
+}
+
+model StockMovement {
+  id                 Int               @id @default(autoincrement())
+  productId          Int
+  product            Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  type               StockMovementType
+  // IN > 0; OUT e SALE < 0; ADJUSTMENT != 0.
+  quantity           Int
+  reason             String?
+  // Despesa gerada junto com a entrada ("lançar compra no caixa"). Restrict: a despesa só some
+  // pelo domínio de estoque, que apaga a movimentação antes.
+  cashEntryId        Int?
+  cashEntry          CashEntry?        @relation(fields: [cashEntryId], references: [id], onDelete: Restrict)
+  // Só em SALE (E9). Restrict: o domínio do atendimento exclui a baixa explicitamente (recalculando o estoque).
+  serviceOrderItemId Int?              @unique
+  serviceOrderItem   ServiceOrderItem? @relation(fields: [serviceOrderItemId], references: [id], onDelete: Restrict)
+  occurredAt         DateTime
+  createdAt          DateTime          @default(now())
+
+  @@index([productId, occurredAt])
+  @@index([cashEntryId])
+}
+
+// Entrega 5: limite de tentativas de login compartilhado entre instâncias serverless (D-43).
+// Chave = e-mail em minúsculas. Não é dado de negócio; registros antigos são apagados sozinhos.
+model LoginAttempt {
+  key         String    @id
+  failures    Int       @default(0)
+  lockedUntil DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  @@index([updatedAt])
+}
